@@ -1,0 +1,176 @@
+// --- Пины управления ---
+const int mLaunch = 43;
+const int mLpwm   = 46;
+const int mLdir   = 47;
+const int mRpwm   = 44;
+const int mRdir   = 45;
+
+// --- Энкодеры ---
+const uint8_t  ENC_RIGHT_PIN = 2;  // Правый энкодер
+const uint8_t  ENC_LEFT_PIN  = 3;  // Левый энкодер 
+const uint16_t SLOTS_N       = 18; // Количество слотов на диске энкодера
+
+// --- Параметры антидребезга и таймаута ---
+const uint32_t MIN_PULSE_US   = 1500;     // антидвоение, мкс
+const uint32_t RPM_TIMEOUT_US = 400000;   // таймаут без импульсов, мкс
+
+// --- Переменные для прерываний ПРАВОГО энкодера ---
+volatile unsigned long lastPulseUs_R = 0;   // время последнего импульса правого
+volatile unsigned long periodUs_R    = 0;   // период между импульсами правого
+volatile bool          newPeriod_R   = false;
+volatile unsigned long pulseTotal_R  = 0;
+
+// --- Переменные для прерываний ЛЕВОГО энкодера ---
+volatile unsigned long lastPulseUs_L = 0;   // время последнего импульса левого
+volatile unsigned long periodUs_L    = 0;   // период между импульсами левого
+volatile bool          newPeriod_L   = false;
+volatile unsigned long pulseTotal_L  = 0;
+
+// --- Параметры PID (пока не используются) ---
+float Kp = 1.0f, Ki = 0.4f, Kd = 0.05f;
+
+// --- Измеренная скорость ПРАВОГО энкодера ---
+float rpm_inst_R = 0.0f;
+float rpm_filt_R = 0.0f;
+
+// --- Измеренная скорость ЛЕВОГО энкодера ---
+float rpm_inst_L = 0.0f;
+float rpm_filt_L = 0.0f;
+
+// --- Общие параметры фильтрации ---
+const float RPM_ALPHA = 0.50f; // коэффициент сглаживания
+
+// --- Функции управления мотором ---
+void launch() {
+  digitalWrite(mLaunch, HIGH);
+  delay(1500);
+  digitalWrite(mLaunch, LOW);
+}
+
+void go(bool ld, int ls, bool rd, int rs) {
+  digitalWrite(mLdir, ld ? HIGH : LOW);
+  analogWrite(mLpwm, constrain(ls, 0, 255));
+  digitalWrite(mRdir, rd ? HIGH : LOW);
+  analogWrite(mRpwm, constrain(rs, 0, 255));
+}
+
+// --- Обработчик прерывания для ПРАВОГО энкодера ---
+void onPulse_R() {
+  unsigned long now = micros();
+  unsigned long dt  = now - lastPulseUs_R;
+  if (dt >= MIN_PULSE_US) {
+    periodUs_R   = dt;
+    newPeriod_R  = true;
+    lastPulseUs_R = now;
+    pulseTotal_R++;
+  }
+}
+
+// --- Обработчик прерывания для ЛЕВОГО энкодера ---
+void onPulse_L() {
+  unsigned long now = micros();
+  unsigned long dt  = now - lastPulseUs_L;
+  if (dt >= MIN_PULSE_US) {
+    periodUs_L   = dt;
+    newPeriod_L  = true;
+    lastPulseUs_L = now;
+    pulseTotal_L++;
+  }
+}
+
+// --- Инициализация ---
+void setup() {
+  // Настройка пинов управления моторами
+  for (int i = 43; i <= 47; i++) pinMode(i, OUTPUT);
+
+  // Запуск системы
+  launch();
+  Serial.begin(115200);
+
+  // Настройка пинов энкодеров
+  pinMode(ENC_RIGHT_PIN, INPUT);
+  pinMode(ENC_LEFT_PIN, INPUT);
+  
+  // Подключение прерываний
+  attachInterrupt(digitalPinToInterrupt(ENC_RIGHT_PIN), onPulse_R, FALLING);
+  attachInterrupt(digitalPinToInterrupt(ENC_LEFT_PIN), onPulse_L, FALLING);
+
+  // Инициализация времени последних импульсов
+  lastPulseUs_R = micros();
+  lastPulseUs_L = micros();
+
+  // Запуск правого колеса (PWM = 70)
+  go(0, 0, 0, 70);
+  
+  // Небольшая задержка для стабилизации
+  delay(100);
+}
+
+// --- Основной цикл ---
+void loop() {
+  // Переменные для временного хранения данных из прерываний
+  bool got_R = false, got_L = false;
+  unsigned long pUs_R = 0, pUs_L = 0;
+  unsigned long lastUs_R, lastUs_L;
+
+  // Атомарно читаем данные из ISR для ПРАВОГО энкодера
+  noInterrupts();
+  got_R = newPeriod_R;
+  if (got_R) {
+    pUs_R = periodUs_R;
+    newPeriod_R = false;
+  }
+  lastUs_R = lastPulseUs_R;
+  interrupts();
+
+  // Атомарно читаем данные из ISR для ЛЕВОГО энкодера
+  noInterrupts();
+  got_L = newPeriod_L;
+  if (got_L) {
+    pUs_L = periodUs_L;
+    newPeriod_L = false;
+  }
+  lastUs_L = lastPulseUs_L;
+  interrupts();
+
+  // --- Расчёт RPM для ПРАВОГО энкодера ---
+  if (got_R && pUs_R > 0) {
+    rpm_inst_R = (60.0f * 1000000.0f) / ((float)SLOTS_N * (float)pUs_R);
+    rpm_filt_R = RPM_ALPHA * rpm_inst_R + (1.0f - RPM_ALPHA) * rpm_filt_R;
+  }
+
+  // --- Расчёт RPM для ЛЕВОГО энкодера ---
+  if (got_L && pUs_L > 0) {
+    rpm_inst_L = (60.0f * 1000000.0f) / ((float)SLOTS_N * (float)pUs_L);
+    rpm_filt_L = RPM_ALPHA * rpm_inst_L + (1.0f - RPM_ALPHA) * rpm_filt_L;
+  }
+
+  // --- Таймаут для ПРАВОГО энкодера ---
+  if ((micros() - lastUs_R) > RPM_TIMEOUT_US) {
+    rpm_inst_R = 0.0f;
+    rpm_filt_R = RPM_ALPHA * 0.0f + (1.0f - RPM_ALPHA) * rpm_filt_R;
+  }
+
+  // --- Таймаут для ЛЕВОГО энкодера ---
+  if ((micros() - lastUs_L) > RPM_TIMEOUT_US) {
+    rpm_inst_L = 0.0f;
+    rpm_filt_L = RPM_ALPHA * 0.0f + (1.0f - RPM_ALPHA) * rpm_filt_L;
+  }
+
+  // --- Вывод скорости на экран ---
+  static unsigned long lastPrintTime = 0;
+  if (millis() - lastPrintTime > 100) { // Выводим каждые 100 мс
+    Serial.print("Right RPM: ");
+    Serial.print(rpm_filt_R);
+    Serial.print(" | Left RPM: ");
+    Serial.println(rpm_filt_L);
+    
+    // Также можно вывести количество импульсов
+    // Serial.print(" | Pulses R: ");
+    // Serial.print(pulseTotal_R);
+    // Serial.print(" L: ");
+    // Serial.println(pulseTotal_L);
+    
+    lastPrintTime = millis();
+  }
+}
