@@ -1,0 +1,264 @@
+// ------------------------- Пины и энкодеры -------------------------
+const int mLaunch = 43;
+const int mLpwm   = 46;
+const int mLdir   = 47;
+const int mRpwm   = 44;
+const int mRdir   = 45;
+int speed = 80;
+const uint8_t ENC_RIGHT_PIN = 2;
+const uint8_t ENC_LEFT_PIN  = 3;
+const uint16_t SLOTS_N = 18;
+
+// ------------------------- Датчики края (лестница) -------------------------
+const int EDGE_LEFT_PIN  = A9;
+const int EDGE_RIGHT_PIN = A10;
+const int EDGE_THRESHOLD = 930;
+
+// ------------------------- Кнопка аварийной остановки -------------------------
+const int EMERGENCY_BUTTON_PIN = A7;
+const int BUTTON_THRESHOLD = 1021;  // если значение выше или равно — стоп
+bool buttonEmergencyStopped = false;
+
+// ------------------------- PID -------------------------
+float integral_R=0, last_error_R=0;
+float integral_L=0, last_error_L=0;
+const float KP = 0.5f, KI = 0.7f, KD = 0.0f;
+const float MAX_INTEGRAL = 100.0f;
+
+// ------------------------- Энкодеры -------------------------
+volatile unsigned long lastPulse_R = 0, period_R = 0;
+volatile bool newPeriod_R = false;
+
+volatile unsigned long lastPulse_L = 0, period_L = 0;
+volatile bool newPeriod_L = false;
+
+float rpm_inst_R=0, rpm_filt_R=0;
+float rpm_inst_L=0, rpm_filt_L=0;
+
+const float RPM_ALPHA = 0.3f;
+static unsigned long lastTime=0;
+const uint32_t MIN_PULSE = 5000;
+const uint32_t RPM_TIMEOUT = 400000;
+
+// ------------------------- Состояния робота (для ИК-датчиков) -------------------------
+enum RobotState {
+    NORMAL,
+    EMERGENCY_STOP,
+    BACKING_UP,
+    WAITING_HELP
+};
+RobotState state = NORMAL;
+unsigned long emergencyStartTime = 0;
+const unsigned long BACKUP_DURATION = 3000;
+
+// ------------------------- Аварийная остановка по ИК-датчикам -------------------------
+void activateEmergencyStop() {
+    if (state == NORMAL) {
+        state = EMERGENCY_STOP;
+        emergencyStartTime = millis();
+        digitalWrite(mLpwm, 0);
+        digitalWrite(mRpwm, 0);
+        Serial.println("EMERGENCY STOP (EDGE DETECTED)");
+    }
+}
+
+// ------------------------- Аварийная остановка по кнопке -------------------------
+void emergencyStopByButton() {
+    if (!buttonEmergencyStopped) {
+        buttonEmergencyStopped = true;
+        digitalWrite(mLpwm, 0);
+        digitalWrite(mRpwm, 0);
+        Serial.println("\n!!! BUTTON EMERGENCY STOP !!!");
+        Serial.println("!!! ROBOT STOPPED BY BUTTON !!!");
+        Serial.println("!!! PRESS RESET TO RESTART !!!\n");
+    }
+}
+
+// ------------------------- Проверка кнопки (аналоговое чтение) -------------------------
+bool isButtonPressed() {
+    int buttonValue = analogRead(EMERGENCY_BUTTON_PIN);
+    return (buttonValue >= BUTTON_THRESHOLD);
+}
+
+// ------------------------- Проверка датчиков края -------------------------
+bool isEdgeDetected() {
+    int leftVal  = analogRead(EDGE_LEFT_PIN);
+    int rightVal = analogRead(EDGE_RIGHT_PIN);
+    return (leftVal > EDGE_THRESHOLD || rightVal > EDGE_THRESHOLD);
+}
+
+bool isGroundDetected() {
+    int leftVal  = analogRead(EDGE_LEFT_PIN);
+    int rightVal = analogRead(EDGE_RIGHT_PIN);
+    return (leftVal < EDGE_THRESHOLD && rightVal < EDGE_THRESHOLD);
+}
+
+// ------------------------- Движение -------------------------
+void go(int target_rpm_L, int target_rpm_R) {
+    const float dt = 0.02f;
+
+    // ===== RIGHT =====
+    bool dirR = target_rpm_R < 0;
+    float targetAbsR = fabs(target_rpm_R);
+    float error_R = targetAbsR - rpm_filt_R;
+    if (targetAbsR == 0) integral_R=0;
+    integral_R += error_R * dt;
+    integral_R = constrain(integral_R, 0, MAX_INTEGRAL);
+    float outR = 0.7f * targetAbsR + KP*error_R + KI*integral_R + KD*(error_R-last_error_R)/dt;
+    last_error_R = error_R;
+    int pwmR = constrain((int)outR, 0, 255);
+    digitalWrite(mRdir, dirR);
+    analogWrite(mRpwm, pwmR);
+
+    // ===== LEFT =====
+    bool dirL = target_rpm_L < 0;
+    float targetAbsL = fabs(target_rpm_L);
+    float error_L = targetAbsL - rpm_filt_L;
+    if (targetAbsL==0) integral_L=0;
+    integral_L += error_L * dt;
+    integral_L = constrain(integral_L,0,MAX_INTEGRAL);
+    float outL = 0.7f * targetAbsL + KP*error_L + KI*integral_L + KD*(error_L-last_error_L)/dt;
+    last_error_L = error_L;
+    int pwmL = constrain((int)outL,0,255);
+    digitalWrite(mLdir, dirL);
+    analogWrite(mLpwm, pwmL);
+}
+
+// ------------------------- Прерывания -------------------------
+void onPulse_R() {
+    unsigned long now = micros();
+    unsigned long dt = now - lastPulse_R;
+    if (dt >= MIN_PULSE) {
+        period_R = dt;
+        newPeriod_R = true;
+        lastPulse_R = now;
+    }
+}
+
+void onPulse_L() {
+    unsigned long now = micros();
+    unsigned long dt = now - lastPulse_L;
+    if (dt >= MIN_PULSE) {
+        period_L = dt;
+        newPeriod_L = true;
+        lastPulse_L = now;
+    }
+}
+
+// ------------------------- Setup -------------------------
+void setup() {
+    for (int i=43;i<=47;i++) pinMode(i,OUTPUT);
+    digitalWrite(mLaunch,HIGH); delay(1500); digitalWrite(mLaunch,LOW);
+    Serial.begin(115200);
+
+    pinMode(ENC_RIGHT_PIN,INPUT);
+    pinMode(ENC_LEFT_PIN,INPUT);
+    attachInterrupt(digitalPinToInterrupt(ENC_RIGHT_PIN), onPulse_R, FALLING);
+    attachInterrupt(digitalPinToInterrupt(ENC_LEFT_PIN), onPulse_L, FALLING);
+
+    lastPulse_R = micros();
+    lastPulse_L = micros();
+    
+    pinMode(EDGE_LEFT_PIN, INPUT);
+    pinMode(EDGE_RIGHT_PIN, INPUT);
+    
+    pinMode(EMERGENCY_BUTTON_PIN, INPUT);
+    
+    delay(100);
+    Serial.println("=== ROBOT STARTED ===");
+}
+
+// ------------------------- Loop -------------------------
+void loop() {
+    // *** ПЕРВОЕ ДЕЛО: проверяем кнопку аварийной остановки ***
+    if (isButtonPressed()) {
+        emergencyStopByButton();
+    }
+    
+    if (buttonEmergencyStopped) {
+        delay(100);
+        return;
+    }
+    
+    // ===== Обработка состояний от ИК-датчиков =====
+    
+    if (state == NORMAL) {
+        if (isEdgeDetected()) {
+            activateEmergencyStop();
+        } else {
+            bool got_R=false, got_L=false;
+            unsigned long p_R=0, p_L=0;
+            unsigned long last_R, last_L;
+
+            noInterrupts();
+            got_R = newPeriod_R;
+            if (got_R) { p_R = period_R; newPeriod_R=false; }
+            last_R = lastPulse_R;
+            interrupts();
+
+            noInterrupts();
+            got_L = newPeriod_L;
+            if (got_L) { p_L = period_L; newPeriod_L=false; }
+            last_L = lastPulse_L;
+            interrupts();
+
+            if (got_R && p_R>0) {
+                rpm_inst_R = 60e6 / (SLOTS_N * p_R);
+                rpm_filt_R = RPM_ALPHA*rpm_inst_R + (1-RPM_ALPHA)*rpm_filt_R;
+            }
+            if (got_L && p_L>0) {
+                rpm_inst_L = 60e6 / (SLOTS_N * p_L);
+                rpm_filt_L = RPM_ALPHA*rpm_inst_L + (1-RPM_ALPHA)*rpm_filt_L;
+            }
+
+            if (micros()-last_R>RPM_TIMEOUT) rpm_filt_R *= (1-RPM_ALPHA);
+            if (micros()-last_L>RPM_TIMEOUT) rpm_filt_L *= (1-RPM_ALPHA);
+            
+            static unsigned long lastPrint = 0;
+            if (millis() - lastPrint > 100) {
+                lastPrint = millis();
+                Serial.print("Right RPM: ");
+                Serial.print(rpm_filt_R);
+                Serial.print(" | Left RPM: ");
+                Serial.println(rpm_filt_L);
+            }
+            
+            if (millis()-lastTime>20) {
+                lastTime = millis();
+                go(80, 80);
+            }
+        }
+    }
+    
+    else if (state == EMERGENCY_STOP) {
+        if (millis() - emergencyStartTime >= 5000) {
+            state = BACKING_UP;
+            Serial.println("BACKING UP");
+            emergencyStartTime = millis();
+        }
+        delay(10);
+    }
+    
+    else if (state == BACKING_UP) {
+        go(-50, -50);
+        
+        if (millis() - emergencyStartTime >= BACKUP_DURATION) {
+            state = WAITING_HELP;
+            digitalWrite(mLpwm, 0);
+            digitalWrite(mRpwm, 0);
+            Serial.println("ERROR: GROUND NOT FOUND - WAITING FOR HELP");
+        }
+        else if (isGroundDetected()) {
+            state = NORMAL;
+            Serial.println("GROUND DETECTED - RESUME NORMAL OPERATION");
+            digitalWrite(mLpwm, 0);
+            digitalWrite(mRpwm, 0);
+            delay(500);
+        }
+        delay(20);
+    }
+    
+    else if (state == WAITING_HELP) {
+        delay(100);
+    }
+}
