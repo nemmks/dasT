@@ -1,0 +1,17 @@
+  const int BUTTON_PIN = A7;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  Serial.println("=== A7 BUTTON TEST ===");
+  Serial.println("Press button to see value change");
+}
+
+void loop() {
+  int buttonValue = analogRead(BUTTON_PIN);
+  
+  Serial.print("A7 value: ");
+  Serial.println(buttonValue);
+  
+  delay(100);
+}
